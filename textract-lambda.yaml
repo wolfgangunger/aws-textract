@@ -1,0 +1,199 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Lambda to extract text lines from a pdf file in s3, using Textract"
+
+Parameters:
+
+  AccountName:
+    Description: Account name, used to prefix resources
+    Type: String
+
+  OwnerName:
+    Description: An owner name, used in tags
+    Type: String
+
+Resources:
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: !Sub "${AccountName}-textract-lambda-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - textract:DetectDocumentText
+                  - textract:StartDocumentTextDetection
+                  - textract:GetDocumentTextDetection
+                  - textract:StartDocumentAnalysis
+                  - textract:GetDocumentAnalysis
+                Resource: 
+                - "*"
+        - PolicyName: !Sub "${AccountName}-s3-lambda-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: 
+                - !Sub "arn:aws:s3:::${AccountName}-textract-bucket/*"
+      Tags:
+        - Key: Name
+          Value: "LambdaExecutionRole"
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  ###### Create a bucket to store the pdf files
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AccountName}-textract-bucket"
+      Tags:
+        - Key: Name
+          Value: "TextractBucket"
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  ########## lambda
+  ConvertPdfToTextLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      FunctionName: !Sub "${AccountName}-textract-lambda"
+      MemorySize: 512
+      Timeout: 300
+      Role:
+        "Fn::GetAtt":
+          - LambdaExecutionRole
+          - Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+                  """
+                  Purpose
+                  An AWS lambda function that analyzes documents with Amazon Textract, 
+                  Input: 
+                  {
+                    "S3Object": {
+                      "Bucket": "<bucket-name>",
+                      "Name": "<object-key>"
+                    }
+                  }
+                  Output:Create a new object in the same bucket with the "-output.txt" suffix, with the result of the Text extraction.
+                  """
+                  import json
+                  import base64
+                  import logging
+                  import boto3
+                  import time
+                  from botocore.exceptions import ClientError
+
+
+                  # Get the boto3 client.
+                  textract_client = boto3.client('textract')
+                  s3 = boto3.resource('s3')
+
+                  def analyze_image(event):
+                      
+                      # format input
+                      image = {'S3Object':
+                                  {'Bucket':  event['S3Object']['Bucket'],
+                                    'Name': event['S3Object']['Name']}
+                                  }
+
+                      # Start document detection Job
+                      Start = textract_client.start_document_analysis(DocumentLocation=image,FeatureTypes=['TABLES','FORMS',])
+                      jobid = Start['JobId']
+                      
+                      # Wait until Job Succeed   
+                      status = textract_client.get_document_analysis(JobId=jobid)
+                      max_loops = 30
+                      loops = 0
+                      while status['JobStatus'] != 'SUCCEEDED' and loops <= max_loops:
+                          time.sleep(10)
+                          loops += 1
+                          status = textract_client.get_document_analysis(JobId=jobid)
+                          
+                          
+                      # Loop thru paginations
+                      paginationToken = None
+                      finished = False
+                      maxResults = 1000
+                      responselist = []  
+                      paginationcount = 1
+                      while finished == False:
+
+                          response = None
+                      
+                          if paginationToken == None:
+
+                              response = textract_client.get_document_analysis(JobId=jobid, MaxResults=maxResults)
+                          else:
+                              response = textract_client.get_document_analysis(JobId=jobid, MaxResults=maxResults, NextToken=paginationToken)
+                              
+                          pagecount = response['DocumentMetadata']['Pages']
+                          responselist.append(response)
+                          # Get next page token or stop processing
+                          if 'NextToken' in response:
+                              paginationToken = response['NextToken']
+                              paginationcount += 1
+                          else:
+                              finished = True
+                              
+                          
+                      line_block = []
+                      # read the raw textract response and extract required attributes Lines
+                      for pageno in range(1, pagecount + 1):
+                          key_value_ids = {}
+                          key_value_set_block = []
+                          word_block = []
+                          for response in responselist:
+                              blocks = response['Blocks']
+                              for each_dict in blocks:
+                                  if each_dict['BlockType'] == 'LINE' and each_dict['Page'] == pageno:
+                                      line_block.append(each_dict)
+                    
+                          each_dict = {}
+                          each_relation = []
+                      
+                      return line_block
+
+
+
+                  def lambda_handler(event,context):
+                    
+                      # Get analysis results.
+                      result = analyze_image(event)
+                      output = []
+                          
+                      # Get Line texts         
+                      for block in result:
+                          if block['BlockType'] == 'LINE':
+                              output.append( block['Text'])
+                      output_content = '\n'.join(output)
+                      
+                      s3.Object(event['S3Object']['Bucket'], event['S3Object']['Name']+'-output.txt' ).put(Body=output_content)
+                              
+                      return event['S3Object']['Name']+'-output.txt'
+
+
+      Description: Converts a pdf file to text using Textract
+      Tags:
+        - Key: Name
+          Value: "ConvertPdfToTextLambda"
+        - Key: Owner
+          Value: !Ref OwnerName
